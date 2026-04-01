@@ -1,6 +1,6 @@
 # **Starship Valindra: Deep Archive Node**
 
-![image1.png]
+![image1.png](image1.png)
 
 **Live Demo:** [https://lxdangerdoll.github.io/starship-valindra/](https://lxdangerdoll.github.io/starship-valindra/)
 
