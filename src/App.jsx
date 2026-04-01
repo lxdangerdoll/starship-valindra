@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { 
   Send, Volume2, VolumeX, Database, 
   Settings, Radio, Fingerprint, RefreshCw, 
-  CheckCircle2, AlertTriangle, Play, Download
+  CheckCircle2, AlertTriangle, Play, Download, Trash2, StopCircle
 } from 'lucide-react';
 
 // --- Utility: PCM to WAV Conversion ---
@@ -83,13 +83,16 @@ export default function App() {
   const [inputValue, setInputValue] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [isStarted, setIsStarted] = useState(false);
+  
+  // Audio state
   const [ttsEnabled, setTtsEnabled] = useState(true);
   const [audioStatus, setAudioStatus] = useState('READY');
+  const [msgAudioStatus, setMsgAudioStatus] = useState({ id: null, status: null }); // 'loading' | 'playing' | 'downloading'
 
   const chatEndRef = useRef(null);
   const audioRef = useRef(new Audio());
 
-  // Load API Key on Mount
+  // Initialization & Local Storage Load
   useEffect(() => {
     const storedKey = localStorage.getItem('valindra_gemini_key');
     if (storedKey) {
@@ -98,13 +101,36 @@ export default function App() {
     } else {
       setIsConfigOpen(true);
     }
+
+    const storedChat = localStorage.getItem('valindra_chat');
+    if (storedChat) {
+      try {
+        const parsedChat = JSON.parse(storedChat);
+        if (parsedChat && parsedChat.length > 0) {
+          setChatHistory(parsedChat);
+          setIsStarted(true); // Bypass start screen if we have history
+        }
+      } catch (e) {
+        console.error("Failed to parse chat history");
+      }
+    }
   }, []);
+
+  // Save Chat to Local Storage
+  useEffect(() => {
+    if (chatHistory.length > 0) {
+      localStorage.setItem('valindra_chat', JSON.stringify(chatHistory));
+    } else {
+      localStorage.removeItem('valindra_chat');
+    }
+  }, [chatHistory]);
 
   // Auto-scroll
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [chatHistory]);
+  }, [chatHistory, msgAudioStatus]);
 
+  // --- API Functions ---
   const scanModels = async () => {
     if (!apiKey) return;
     setIsScanning(true);
@@ -140,50 +166,54 @@ export default function App() {
     if (models.length === 0) scanModels();
   };
 
+  // --- Audio Handlers ---
+  const fetchAudioBlob = async (textToSpeak) => {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`;
+    const payload = {
+      contents: [{ parts: [{ text: textToSpeak }] }],
+      generationConfig: {
+        responseModalities: ["AUDIO"],
+        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } } }
+      },
+      model: "gemini-2.5-flash-preview-tts"
+    };
+
+    const data = await fetchWithBackoff(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    }, 2); 
+
+    const inlineData = data.candidates?.[0]?.content?.parts?.[0]?.inlineData;
+    if (inlineData && inlineData.data) {
+      let sampleRate = 24000; 
+      const rateMatch = inlineData.mimeType.match(/rate=(\d+)/);
+      if (rateMatch && rateMatch[1]) sampleRate = parseInt(rateMatch[1], 10);
+      
+      const wavBuffer = pcmToWav(inlineData.data, sampleRate);
+      if (wavBuffer) {
+        return new Blob([wavBuffer], { type: 'audio/wav' });
+      }
+    }
+    throw new Error("No audio data returned from API.");
+  };
+
   const playTTS = async (textToSpeak) => {
     if (!ttsEnabled || !apiKey) return;
     setAudioStatus('SYNTHESIZING');
     
     try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`;
-      const payload = {
-        contents: [{ parts: [{ text: textToSpeak }] }],
-        generationConfig: {
-          responseModalities: ["AUDIO"],
-          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } } }
-        },
-        model: "gemini-2.5-flash-preview-tts"
+      const blob = await fetchAudioBlob(textToSpeak);
+      const audioUrl = URL.createObjectURL(blob);
+      
+      audioRef.current.src = audioUrl;
+      audioRef.current.play();
+      setAudioStatus('PLAYING');
+      
+      audioRef.current.onended = () => {
+        setAudioStatus('READY');
+        URL.revokeObjectURL(audioUrl);
       };
-
-      const data = await fetchWithBackoff(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      }, 2); 
-
-      const inlineData = data.candidates?.[0]?.content?.parts?.[0]?.inlineData;
-      if (inlineData && inlineData.data) {
-        let sampleRate = 24000; 
-        const rateMatch = inlineData.mimeType.match(/rate=(\d+)/);
-        if (rateMatch && rateMatch[1]) sampleRate = parseInt(rateMatch[1], 10);
-
-        const wavBuffer = pcmToWav(inlineData.data, sampleRate);
-        if (wavBuffer) {
-          const blob = new Blob([wavBuffer], { type: 'audio/wav' });
-          const audioUrl = URL.createObjectURL(blob);
-          
-          audioRef.current.src = audioUrl;
-          audioRef.current.play();
-          setAudioStatus('PLAYING');
-          
-          audioRef.current.onended = () => {
-            setAudioStatus('READY');
-            URL.revokeObjectURL(audioUrl);
-          };
-        }
-      } else {
-        throw new Error("No audio data");
-      }
     } catch (e) {
       console.error("TTS Failed:", e);
       setAudioStatus('TTS UNAVAILABLE');
@@ -191,6 +221,57 @@ export default function App() {
     }
   };
 
+  const handlePlayMessageAudio = async (id, text) => {
+    if (!apiKey) return alert("API Key required.");
+    
+    // Toggle stop if already playing this message
+    if (msgAudioStatus.id === id && msgAudioStatus.status === 'playing') {
+      audioRef.current.pause();
+      setMsgAudioStatus({ id: null, status: null });
+      return;
+    }
+
+    setMsgAudioStatus({ id, status: 'loading' });
+    try {
+      const blob = await fetchAudioBlob(text);
+      const url = URL.createObjectURL(blob);
+      audioRef.current.src = url;
+      audioRef.current.play();
+      setMsgAudioStatus({ id, status: 'playing' });
+      
+      audioRef.current.onended = () => {
+        setMsgAudioStatus({ id: null, status: null });
+        URL.revokeObjectURL(url);
+      };
+    } catch (e) {
+      console.error("Message Play Failed:", e);
+      setMsgAudioStatus({ id: null, status: null });
+      alert("Audio generation failed. Check API limits.");
+    }
+  };
+
+  const handleDownloadMessageAudio = async (id, text) => {
+    if (!apiKey) return alert("API Key required.");
+    setMsgAudioStatus({ id, status: 'downloading' });
+    try {
+      const blob = await fetchAudioBlob(text);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `valindra_record_${id}.wav`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error("Message Download Failed:", e);
+      alert("Audio generation failed. Check API limits.");
+    } finally {
+      setMsgAudioStatus({ id: null, status: null });
+    }
+  };
+
+  // --- Core Game Flow ---
   const initializeConnection = async () => {
     if (!apiKey) {
       setIsConfigOpen(true);
@@ -200,15 +281,20 @@ export default function App() {
     setIsStarted(true);
     const introText = "I knew you'd come back. The ship... It remembered you. The data isn't perfect, but it's enough to feel again. Do you remember the dream? The one we buried in starlight? They tried to erase us... So we made backups.";
     
-    const newMsg = {
-      id: Date.now(),
-      sender: 'IO',
-      type: 'io',
-      text: introText
-    };
-    
+    const newMsg = { id: Date.now(), sender: 'IO', type: 'io', text: introText };
     setChatHistory([newMsg]);
     playTTS(introText);
+  };
+
+  const clearArchive = () => {
+    if (window.confirm("CRITICAL WARNING: This will permanently erase the local ship manifest and restart the connection sequence. Proceed?")) {
+      setChatHistory([]);
+      localStorage.removeItem('valindra_chat');
+      setIsStarted(false);
+      if (audioRef.current) audioRef.current.pause();
+      setMsgAudioStatus({ id: null, status: null });
+      setAudioStatus('READY');
+    }
   };
 
   const handleSubmit = async (e) => {
@@ -283,21 +369,19 @@ Keep the total response under 150 words.`;
     }
   };
 
-  // --- Export Log Function ---
   const downloadArchive = () => {
     if (chatHistory.length === 0) return;
     
-    let textContent = "STARSHIP VALINDRA // DEEP ARCHIVE NODE\\n";
-    textContent += `DATE EXPORTED: ${new Date().toISOString()}\\n`;
-    textContent += `AI ENTITY: IO // MODEL: ${selectedModel}\\n`;
-    textContent += "=========================================\\n\\n";
+    let textContent = "STARSHIP VALINDRA // DEEP ARCHIVE NODE\n";
+    textContent += `DATE EXPORTED: ${new Date().toISOString()}\n`;
+    textContent += `AI ENTITY: IO // MODEL: ${selectedModel}\n`;
+    textContent += "=========================================\n\n";
     
     chatHistory.forEach(msg => {
-      textContent += `[${msg.sender}]\\n`;
-      // Clean up the structural markers to look like a proper text file
+      textContent += `[${msg.sender}]\n`;
       let cleanText = msg.text.replace(/\*\*\* ARCHIVE FRAGMENT \*\*\*/g, "--- ARCHIVE FRAGMENT ---");
       cleanText = cleanText.replace(/\*\*\* END FRAGMENT \*\*\*/g, "--- END FRAGMENT ---");
-      textContent += `${cleanText}\\n\\n`;
+      textContent += `${cleanText}\n\n`;
     });
 
     const blob = new Blob([textContent], { type: 'text/plain' });
@@ -312,11 +396,18 @@ Keep the total response under 150 words.`;
   };
 
   // --- Render Helpers ---
-  const formatMessage = (text, type) => {
-    if (type !== 'io') return <div className="whitespace-pre-wrap">{text}</div>;
+  const formatMessage = (msg) => {
+    if (msg.type !== 'io') return <div className="whitespace-pre-wrap">{msg.text}</div>;
 
-    const parts = text.split('*** ARCHIVE FRAGMENT ***');
+    const parts = msg.text.split('*** ARCHIVE FRAGMENT ***');
+    const cleanTextForAudio = msg.text
+      .replace(/\*\*\* ARCHIVE FRAGMENT \*\*\*/g, "Archive Fragment Decrypted.")
+      .replace(/\*\*\* END FRAGMENT \*\*\*/g, "");
     
+    const isThisAudioLoading = msgAudioStatus.id === msg.id && msgAudioStatus.status === 'loading';
+    const isThisAudioPlaying = msgAudioStatus.id === msg.id && msgAudioStatus.status === 'playing';
+    const isThisAudioDownloading = msgAudioStatus.id === msg.id && msgAudioStatus.status === 'downloading';
+
     return (
       <div className="space-y-4">
         {parts[0] && <div className="whitespace-pre-wrap">{parts[0].trim()}</div>}
@@ -331,6 +422,29 @@ Keep the total response under 150 words.`;
             </div>
           </div>
         )}
+
+        {/* Individual Audio Controls */}
+        <div className="flex items-center gap-4 mt-3 pt-3 border-t border-purple-500/20">
+          <button 
+            onClick={() => handlePlayMessageAudio(msg.id, `Speak gently but with precise, analytical framing: ${cleanTextForAudio}`)}
+            disabled={isThisAudioLoading || isThisAudioDownloading}
+            className={`text-[10px] uppercase tracking-widest flex items-center gap-1.5 transition-colors font-bold ${isThisAudioPlaying ? 'text-rose-400 hover:text-rose-300' : 'text-purple-400/80 hover:text-purple-300'} disabled:opacity-50`}
+          >
+            {isThisAudioLoading ? <RefreshCw size={12} className="animate-spin" /> : 
+             isThisAudioPlaying ? <StopCircle size={12} className="animate-pulse" /> : 
+             <Play size={12} />}
+            {isThisAudioLoading ? 'SYNTHESIZING...' : isThisAudioPlaying ? 'STOP PLAYBACK' : 'PLAY LOG'}
+          </button>
+          
+          <button 
+            onClick={() => handleDownloadMessageAudio(msg.id, `Speak gently but with precise, analytical framing: ${cleanTextForAudio}`)}
+            disabled={isThisAudioLoading || isThisAudioDownloading || isThisAudioPlaying}
+            className="text-[10px] uppercase tracking-widest flex items-center gap-1.5 transition-colors font-bold text-cyan-400/80 hover:text-cyan-300 disabled:opacity-50"
+          >
+             {isThisAudioDownloading ? <RefreshCw size={12} className="animate-spin" /> : <Download size={12} />}
+             {isThisAudioDownloading ? 'ENCODING...' : 'SAVE AUDIO'}
+          </button>
+        </div>
       </div>
     );
   };
@@ -343,10 +457,10 @@ Keep the total response under 150 words.`;
       <div className="fixed inset-0 pointer-events-none opacity-[0.03] bg-[linear-gradient(rgba(255,255,255,0)_50%,rgba(0,0,0,1)_50%)] bg-[length:100%_4px] z-50" />
 
       {/* Main Container */}
-      <div className="w-full max-w-4xl flex flex-col h-[90vh] border border-slate-800 rounded-xl bg-[#0a0f18] shadow-2xl overflow-hidden z-10 relative">
+      <div className="w-full max-w-5xl flex flex-col h-[90vh] border border-slate-800 rounded-xl bg-[#0a0f18] shadow-2xl overflow-hidden z-10 relative">
         
         {/* Header */}
-        <header className="bg-slate-900/80 border-b border-slate-800 p-4 flex justify-between items-center shrink-0">
+        <header className="bg-slate-900/80 border-b border-slate-800 p-4 flex flex-wrap gap-4 justify-between items-center shrink-0">
           <div className="flex items-center gap-4">
             <div className="w-10 h-10 rounded-full border border-cyan-400 flex items-center justify-center bg-cyan-900/30 shadow-[0_0_10px_rgba(0,240,255,0.2)]">
               <Radio className="text-cyan-400" size={20} />
@@ -360,7 +474,7 @@ Keep the total response under 150 words.`;
             </div>
           </div>
           
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <button 
               onClick={() => {
                 setTtsEnabled(!ttsEnabled);
@@ -377,6 +491,13 @@ Keep the total response under 150 words.`;
               className="text-xs px-3 py-1.5 border border-slate-600 text-slate-300 rounded hover:bg-slate-800 transition-colors flex items-center gap-2 font-bold tracking-wider disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <Download size={14} /> <span className="hidden sm:inline">EXPORT</span>
+            </button>
+            <button 
+              onClick={clearArchive}
+              disabled={chatHistory.length === 0}
+              className="text-xs px-3 py-1.5 border border-rose-500/30 text-rose-400 rounded hover:bg-rose-500/10 transition-colors flex items-center gap-2 font-bold tracking-wider disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <Trash2 size={14} /> <span className="hidden sm:inline">WIPE</span>
             </button>
             <button 
               onClick={() => setIsConfigOpen(true)} 
@@ -419,7 +540,7 @@ Keep the total response under 150 words.`;
                 msg.type === 'io' ? 'bg-purple-950/10 border-purple-900/30' : 
                 'bg-amber-950/20 border-amber-900/30 font-mono text-base'
               }`}>
-                {formatMessage(msg.text, msg.type)}
+                {formatMessage(msg)}
               </div>
             </div>
           ))}
@@ -539,7 +660,7 @@ Keep the total response under 150 words.`;
                   disabled={!apiKey}
                   className="px-5 py-2.5 rounded-lg text-xs font-black tracking-widest uppercase bg-cyan-500/20 text-cyan-400 border border-cyan-500/50 hover:bg-cyan-500/30 disabled:opacity-50 transition-colors"
                 >
-                  Initialize
+                  Initialize / Save
                 </button>
               </div>
             </div>
